@@ -10,7 +10,6 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/servicediscovery"
 )
@@ -18,50 +17,97 @@ import (
 const TAG_PREFIX = "plos/"
 
 const REGISTER_EVENT = "EC2 Instance Launch Successful"
-const UNREGISTER_EVENT = "EC2 Instance-terminate Lifecycle Action"
+const UNREGISTER_EVENT = "EC2 Instance Terminate Successful"
 
 func Handler(ctx context.Context, event events.AutoScalingEvent) {
-	asgName := event.Detail["AutoScalingGroupName"].(string)
-	asgArn := event.Resources[0]
 	ec2Id := event.Detail["EC2InstanceId"].(string)
-
-	asgFilter := autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []*string{&asgName},
-	}
 
 	// Fire up the sessions we need.
 	sess := session.Must(session.NewSession())
-	asgSession := autoscaling.New(sess)
 	sdSession := servicediscovery.New(sess)
-	ec2Session := ec2.New(sess)
 
-	asgResponse, err := asgSession.DescribeAutoScalingGroups(&asgFilter)
+	// Get the related ec2 instance.
+	ec2Instance, err := findEc2Instance(sess, ec2Id)
+	if err != nil {
+		log.Fatalf("Could not find ec2 instance with ID: %v", ec2Id)
+	}
+
+	// Find our tags which follow "plos/$namespace: $service". This will help us find our service ID later.
+	serviceTags := findServiceTags(ec2Instance)
+	if len(serviceTags) == 0 {
+		log.Println("No service tags found, bailing")
+		return
+	}
+
+	awsServices, err := findAwsServices(sdSession, serviceTags)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Find our tags which follow "plos/$namespace: $service". This will help us find our service ID later.
+	// Iterate over the serviceTags and decide to either register or unregister based on event.
+	for _, s := range awsServices {
+		if event.DetailType == REGISTER_EVENT {
+			log.Println("Found register event")
+			registerService(sdSession, s, ec2Instance)
+		} else if event.DetailType == UNREGISTER_EVENT {
+			log.Println("Found deregister event")
+			unregisterService(sdSession, s, ec2Instance)
+		}
+	}
+}
+
+// Find the ec2 Instance associated with this event.
+func findEc2Instance(s *session.Session, id string) (*ec2.Instance, error) {
+	ec2Session := ec2.New(s)
+	ec2Filter := ec2.DescribeInstancesInput{
+		InstanceIds: aws.StringSlice([]string{id}),
+	}
+
+	ec2Response, err := ec2Session.DescribeInstances(&ec2Filter)
+	if err != nil {
+		return nil, err
+	}
+	ec2Instance := ec2Response.Reservations[0].Instances[0]
+	log.Printf("Found ec2 instance: %s\n", *ec2Instance.InstanceId)
+
+	return ec2Instance, nil
+}
+
+// Find any service tags starting with the `TAG_PREFIX` constant.
+func findServiceTags(ec2Instance *ec2.Instance) map[string][]string {
 	services := make(map[string][]string)
-	for _, asg := range asgResponse.AutoScalingGroups {
-		if *asg.AutoScalingGroupARN == asgArn {
-			for _, tag := range asg.Tags {
-				if strings.HasPrefix(*tag.Key, TAG_PREFIX) {
-					namespace := strings.Split(*tag.Key, "/")[1]
-					services[namespace] = append(services[namespace], *tag.Value)
-				}
-			}
+	for _, tag := range ec2Instance.Tags {
+		if strings.HasPrefix(*tag.Key, TAG_PREFIX) {
+			log.Printf("Found tag '%s: %s' on ec2 %s\n", *tag.Key, *tag.Value, *ec2Instance.InstanceId)
+			namespace := strings.Split(*tag.Key, "/")[1]
+			services[namespace] = append(services[namespace], *tag.Value)
 		}
 	}
 
-	// Iterate over our namespace and services, we filter down our services by namespace so we don't pull
-	// all of our services. This will also allow us to register multiple services, under varying namespaces.
+	return services
+}
+
+// Find the aws service discovery endpoints we want to register with.
+func findAwsServices(sdSession *servicediscovery.ServiceDiscovery, serviceTags map[string][]string) ([]*servicediscovery.ServiceSummary, error) {
+	// We first filter down by namespace, we want to get a mapping of namespace names to namespace IDs to
+	// use later. If we get over 100 namespaces this will need to be revisited.
+	nsResponse, err := sdSession.ListNamespaces(&servicediscovery.ListNamespacesInput{})
+	if err != nil {
+		return nil, err
+	}
+	nsIDmap := make(map[string]string)
+	for _, ns := range nsResponse.Namespaces {
+		nsIDmap[*ns.Name] = *ns.Id
+	}
+
+
 	var awsServices []*servicediscovery.ServiceSummary
-	for ns, services := range services {
+	for ns, services := range serviceTags {
 		// Filter down to the relevant namespace and build the request input.
 		serviceFilter := servicediscovery.ServiceFilter{
 			Condition: aws.String(servicediscovery.FilterConditionEq),
 			Name: aws.String(servicediscovery.OperationFilterNameNamespaceId),
-			Values: aws.StringSlice([]string{ ns }),
+			Values: aws.StringSlice([]string{ nsIDmap[ns] }),
 
 		}
 		serviceInput := servicediscovery.ListServicesInput{
@@ -71,38 +117,21 @@ func Handler(ctx context.Context, event events.AutoScalingEvent) {
 		// List off the services that match our filter.
 		servicesResponse, err := sdSession.ListServices(&serviceInput)
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 
 		// Match our tags to the services and save them for later
 		for _, s := range servicesResponse.Services {
 			for _, plosService := range services {
 				if *s.Name == plosService {
+					log.Printf("Found matching service: %s\n", *s.Name)
 					awsServices = append(awsServices, s)
 				}
 			}
 		}
 	}
 
-	// We need to find our ec2 instance so we can grab the private IP.
-	ec2Filter := ec2.DescribeInstancesInput{
-		InstanceIds: []*string{&ec2Id},
-	}
-
-	ec2Response, err := ec2Session.DescribeInstances(&ec2Filter)
-	if err != nil {
-		log.Fatal(err)
-	}
-	ec2Instance := ec2Response.Reservations[0].Instances[0]
-
-	// Iterate over the services and decide to either register or unregister based on event.
-	for _, s := range awsServices {
-		if event.DetailType == REGISTER_EVENT {
-			registerService(sdSession, s, ec2Instance)
-		} else if event.DetailType == UNREGISTER_EVENT {
-			unregisterService(sdSession, s, ec2Instance)
-		}
-	}
+	return awsServices, nil
 }
 
 func registerService(sd *servicediscovery.ServiceDiscovery, service *servicediscovery.ServiceSummary, ec2Instance *ec2.Instance) {
@@ -117,6 +146,7 @@ func registerService(sd *servicediscovery.ServiceDiscovery, service *servicedisc
 	if err != nil {
 		log.Println(err)
 	}
+	log.Printf("registered %s with ip %s to service %s\n", *ec2Instance.InstanceId, *ec2Instance.PrivateIpAddress, *service.Name)
 }
 
 func unregisterService(sd *servicediscovery.ServiceDiscovery, service *servicediscovery.ServiceSummary, ec2Instance *ec2.Instance) {
@@ -129,6 +159,7 @@ func unregisterService(sd *servicediscovery.ServiceDiscovery, service *servicedi
 	if err != nil {
 		log.Println(err)
 	}
+	log.Printf("deregistered %s with ip %s to service %s\n", *ec2Instance.InstanceId, *ec2Instance.PrivateIpAddress, *service.Name)
 }
 
 func main() {
