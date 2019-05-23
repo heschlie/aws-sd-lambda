@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -14,12 +15,13 @@ import (
 	"github.com/aws/aws-sdk-go/service/servicediscovery"
 )
 
-const TAG_PREFIX = "plos/"
+var TAG_PREFIX string
 
 const REGISTER_EVENT = "EC2 Instance Launch Successful"
 const UNREGISTER_EVENT = "EC2 Instance Terminate Successful"
 
 func Handler(ctx context.Context, event events.AutoScalingEvent) {
+	TAG_PREFIX = os.Getenv("TAG_PREFIX")
 	ec2Id := event.Detail["EC2InstanceId"].(string)
 
 	// Fire up the sessions we need.
@@ -32,7 +34,7 @@ func Handler(ctx context.Context, event events.AutoScalingEvent) {
 		log.Fatalf("Could not find ec2 instance with ID: %v", ec2Id)
 	}
 
-	// Find our tags which follow "plos/$namespace: $service". This will help us find our service ID later.
+	// Find our tags which follow "TAG_PREFIX/$namespace: $service". This will help us find our service ID later.
 	serviceTags := findServiceTags(ec2Instance)
 	if len(serviceTags) == 0 {
 		log.Println("No service tags found, bailing")
@@ -80,7 +82,8 @@ func findServiceTags(ec2Instance *ec2.Instance) map[string][]string {
 		if strings.HasPrefix(*tag.Key, TAG_PREFIX) {
 			log.Printf("Found tag '%s: %s' on ec2 %s\n", *tag.Key, *tag.Value, *ec2Instance.InstanceId)
 			namespace := strings.Split(*tag.Key, "/")[1]
-			services[namespace] = append(services[namespace], *tag.Value)
+			tags := strings.Split(*tag.Value, ",")
+			services[namespace] = tags
 		}
 	}
 
