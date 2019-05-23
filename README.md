@@ -21,3 +21,8 @@ Then matches those tags to the Namespace, and Service to register against.
 
 You pass an env var to the lambda function that is the prefix this function
 will look for, as `TAG_PREFIX=PREFIX`, do not add the trailing `/`.
+
+# Build
+
+The included Makefile has a package target which will build and zip the
+script for you to upload to AWS Lambda. The Function to target is `Handler`.
