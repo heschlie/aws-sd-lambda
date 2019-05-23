@@ -30,6 +30,13 @@ Only a few roles are needed for this script:
 - AWSCloudMapFullAccess
 - CloudWatchLogsFullAccess
 
+## CloudWatch event streams
+
+You will need to watch a couple of Auto Scaling events, specifically:
+
+- EC2 Instance Launch Successful
+- EC2 Instance Terminate Successful
+
 # Build
 
 The included Makefile has a package target which will build and zip the
