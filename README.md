@@ -26,3 +26,10 @@ will look for, as `TAG_PREFIX=PREFIX`, do not add the trailing `/`.
 
 The included Makefile has a package target which will build and zip the
 script for you to upload to AWS Lambda. The Function to target is `Handler`.
+
+# Some gotchas
+
+- Only supports Route53 IP, or A record discovery
+- If you have more than 100 Namespaces this currently will have a chance to fail
+- If you have more than 100 Services in a Namespace this could also fail
+- The error logging isn't great

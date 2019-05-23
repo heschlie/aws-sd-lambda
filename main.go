@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"log"
 	"os"
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
@@ -31,29 +31,29 @@ func Handler(ctx context.Context, event events.AutoScalingEvent) {
 	// Get the related ec2 instance.
 	ec2Instance, err := findEc2Instance(sess, ec2Id)
 	if err != nil {
-		log.Fatalf("Could not find ec2 instance with ID: %v", ec2Id)
+		log.WithError(err).WithField("ID", ec2Id).Fatal("Could not find ec2 instance")
 	}
 
 	// Find our tags which follow "TAG_PREFIX/$namespace: $service". This will help us find our service ID later.
 	serviceTags := findServiceTags(ec2Instance)
 	if len(serviceTags) == 0 {
-		log.Println("No service tags found, bailing")
+		log.Info("No service tags found")
 		return
 	}
 
 	awsServices, err := findAwsServices(sdSession, serviceTags)
 	if err != nil {
-		log.Fatal(err)
+		log.WithError(err).Fatal("Service lookup failed")
 	}
 
 	// Iterate over the serviceTags and decide to either register or unregister based on event.
 	for _, s := range awsServices {
 		if event.DetailType == REGISTER_EVENT {
-			log.Println("Found register event")
+			log.Info("Found register event")
 			registerService(sdSession, s, ec2Instance)
 		} else if event.DetailType == UNREGISTER_EVENT {
-			log.Println("Found deregister event")
-			unregisterService(sdSession, s, ec2Instance)
+			log.Info("Found deregister event")
+			deregisterService(sdSession, s, ec2Instance)
 		}
 	}
 }
@@ -61,6 +61,8 @@ func Handler(ctx context.Context, event events.AutoScalingEvent) {
 // Find the ec2 Instance associated with this event.
 func findEc2Instance(s *session.Session, id string) (*ec2.Instance, error) {
 	ec2Session := ec2.New(s)
+
+	// Filter down to only the instance we need.
 	ec2Filter := ec2.DescribeInstancesInput{
 		InstanceIds: aws.StringSlice([]string{id}),
 	}
@@ -70,7 +72,7 @@ func findEc2Instance(s *session.Session, id string) (*ec2.Instance, error) {
 		return nil, err
 	}
 	ec2Instance := ec2Response.Reservations[0].Instances[0]
-	log.Printf("Found ec2 instance: %s\n", *ec2Instance.InstanceId)
+	log.WithField("ID", *ec2Instance.InstanceId).Info("Found ec2 instance")
 
 	return ec2Instance, nil
 }
@@ -80,7 +82,9 @@ func findServiceTags(ec2Instance *ec2.Instance) map[string][]string {
 	services := make(map[string][]string)
 	for _, tag := range ec2Instance.Tags {
 		if strings.HasPrefix(*tag.Key, TAG_PREFIX) {
-			log.Printf("Found tag '%s: %s' on ec2 %s\n", *tag.Key, *tag.Value, *ec2Instance.InstanceId)
+			log.WithField("Instance", *ec2Instance.InstanceId).
+				WithField(*tag.Key, *tag.Value).
+				Info("Found tags")
 			namespace := strings.Split(*tag.Key, "/")[1]
 			tags := strings.Split(*tag.Value, ",")
 			services[namespace] = tags
@@ -103,7 +107,7 @@ func findAwsServices(sdSession *servicediscovery.ServiceDiscovery, serviceTags m
 		nsIDmap[*ns.Name] = *ns.Id
 	}
 
-
+	// Here we want to list off the services from each namespace we're interested in and capture their summaries.
 	var awsServices []*servicediscovery.ServiceSummary
 	for ns, services := range serviceTags {
 		// Filter down to the relevant namespace and build the request input.
@@ -127,7 +131,7 @@ func findAwsServices(sdSession *servicediscovery.ServiceDiscovery, serviceTags m
 		for _, s := range servicesResponse.Services {
 			for _, plosService := range services {
 				if *s.Name == plosService {
-					log.Printf("Found matching service: %s\n", *s.Name)
+					log.WithField("service", *s.Name).Info("Found matching service")
 					awsServices = append(awsServices, s)
 				}
 			}
@@ -137,6 +141,8 @@ func findAwsServices(sdSession *servicediscovery.ServiceDiscovery, serviceTags m
 	return awsServices, nil
 }
 
+// registerService will register the given EC2 instance using the Instance ID as a unique ID and the IP address
+// as the target for the service.
 func registerService(sd *servicediscovery.ServiceDiscovery, service *servicediscovery.ServiceSummary, ec2Instance *ec2.Instance) {
 	input := servicediscovery.RegisterInstanceInput{
 		ServiceId: service.Id,
@@ -147,12 +153,21 @@ func registerService(sd *servicediscovery.ServiceDiscovery, service *servicedisc
 
 	_, err := sd.RegisterInstance(&input)
 	if err != nil {
-		log.Println(err)
+		// If we error here just return, other services might register.
+		log.WithError(err).
+			WithField("ID", *ec2Instance.InstanceId).
+			WithField("service", *service.Name).
+			Error("Failed to register instance")
+		return
 	}
-	log.Printf("registered %s with ip %s to service %s\n", *ec2Instance.InstanceId, *ec2Instance.PrivateIpAddress, *service.Name)
+	log.WithField("InstanceID", *ec2Instance.InstanceId).
+		WithField("IPv4", *ec2Instance.PrivateIpAddress).
+		WithField("Service", *service.Name).
+		Info("Successfully registered instance with service")
 }
 
-func unregisterService(sd *servicediscovery.ServiceDiscovery, service *servicediscovery.ServiceSummary, ec2Instance *ec2.Instance) {
+// deregisterService will deregister the given EC2 instance using the EC2 Instance ID from the given Service.
+func deregisterService(sd *servicediscovery.ServiceDiscovery, service *servicediscovery.ServiceSummary, ec2Instance *ec2.Instance) {
 	input := servicediscovery.DeregisterInstanceInput{
 		InstanceId: ec2Instance.InstanceId,
 		ServiceId: service.Id,
@@ -160,9 +175,17 @@ func unregisterService(sd *servicediscovery.ServiceDiscovery, service *servicedi
 
 	_, err := sd.DeregisterInstance(&input)
 	if err != nil {
-		log.Println(err)
+		// If we error here just return, other services might deregister.
+		log.WithError(err).
+			WithField("ID", *ec2Instance.InstanceId).
+			WithField("service", *service.Name).
+			Error("Failed to deregister instance")
+		return
 	}
-	log.Printf("deregistered %s with ip %s to service %s\n", *ec2Instance.InstanceId, *ec2Instance.PrivateIpAddress, *service.Name)
+	log.WithField("InstanceID", *ec2Instance.InstanceId).
+		WithField("IPv4", *ec2Instance.PrivateIpAddress).
+		WithField("Service", *service.Name).
+		Info("Successfully deregistered instance with service")
 }
 
 func main() {
